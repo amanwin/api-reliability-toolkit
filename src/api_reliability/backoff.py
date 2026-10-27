@@ -1,5 +1,7 @@
 """Backoff delay calculation helpers."""
 
+import math
+
 from .exceptions import RetryConfigurationError
 
 
@@ -14,9 +16,9 @@ def exponential_backoff(
         raise RetryConfigurationError("retry_number must be an integer")
     if retry_number < 1:
         raise RetryConfigurationError("retry_number must be at least 1")
-    if base_delay < 0:
+    if math.isnan(base_delay) or base_delay < 0:
         raise RetryConfigurationError("base_delay must be non-negative")
-    if max_delay < 0:
+    if math.isnan(max_delay) or max_delay < 0:
         raise RetryConfigurationError("max_delay must be non-negative")
     if max_delay < base_delay:
         raise RetryConfigurationError(

@@ -21,7 +21,7 @@ def test_invalid_retry_number_is_rejected(retry_number):
 
 @pytest.mark.parametrize(
     ("base_delay", "max_delay"),
-    [(-1, 2), (1, -1), (2, 1)],
+    [(-1, 2), (1, -1), (2, 1), (float("nan"), 2), (1, float("nan"))],
 )
 def test_invalid_delays_are_rejected(base_delay, max_delay):
     with pytest.raises(RetryConfigurationError):

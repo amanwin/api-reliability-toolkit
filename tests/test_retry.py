@@ -132,3 +132,22 @@ def test_invalid_jitter_value_is_rejected():
             random_fn=lambda: 1.0,
             sleep=lambda _: None,
         )
+
+
+@pytest.mark.parametrize(
+    ("base_delay", "max_delay"),
+    [(float("nan"), 1.0), (0.1, float("nan"))],
+)
+def test_nan_delays_are_rejected_before_the_operation_runs(base_delay, max_delay):
+    """Regression: NaN delays used to fail late inside ``sleep`` after the first attempt."""
+    calls = []
+
+    with pytest.raises(RetryConfigurationError):
+        retry_call(
+            lambda: calls.append("call"),
+            base_delay=base_delay,
+            max_delay=max_delay,
+            sleep=lambda _: pytest.fail("sleep should not be called"),
+        )
+
+    assert calls == []
