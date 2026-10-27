@@ -1,6 +1,6 @@
 # API Reliability Toolkit
 
-A small, dependency-light Python library for retrying transient failures in synchronous operations and for protecting failing dependencies with a circuit breaker.
+A small, dependency-light Python library for retrying transient failures in synchronous operations.
 
 ## Features
 
@@ -8,10 +8,10 @@ A small, dependency-light Python library for retrying transient failures in sync
 - Retry filtering by exception type
 - Exponential backoff with an optional maximum delay
 - Optional jitter
-- Injectable sleep and randomness functions for deterministic testing
-- The final retryable exception is re-raised when attempts are exhausted
-- Thread-safe circuit breaker with `CLOSED`, `OPEN`, and `HALF_OPEN` states
-- Optional circuit breaker integration for `retry_call`
+- Injectable sleep, clock, and randomness functions for deterministic testing
+- Optional overall timeout budget for deciding whether another retry may start
+- Thread-safe circuit breaker for failing dependencies
+- The final retryable exception is re-raised unchanged when attempts or the deadline stop retries
 
 ## Requirements
 
@@ -50,43 +50,49 @@ assert result == "success"
 
 `max_attempts` includes the initial call.
 
-### Circuit breaker
+## Deadline-aware retries
+
+Pass `timeout` to set a total time budget, in seconds, for the retry operation:
 
 ```python
-from api_reliability import CircuitBreaker, CircuitOpenError, retry_call
+from api_reliability import retry_call
 
-breaker = CircuitBreaker(
-    failure_threshold=5,      # consecutive failures before opening
-    recovery_timeout=30.0,    # seconds to wait before allowing trial calls
-    half_open_max_calls=1,    # concurrent trial calls allowed while HALF_OPEN
-    failure_on=(ConnectionError, TimeoutError),
+result = retry_call(
+    fetch_data,
+    retry_on=(ConnectionError, TimeoutError),
+    max_attempts=5,
+    base_delay=0.25,
+    max_delay=2.0,
+    timeout=5.0,
 )
-
-def call_remote_api():
-    ...
-
-try:
-    result = retry_call(
-        call_remote_api,
-        max_attempts=3,
-        retry_on=(ConnectionError, TimeoutError),
-        circuit_breaker=breaker,
-    )
-except CircuitOpenError:
-    # The dependency is considered down; fail fast or serve a fallback.
-    ...
 ```
 
-A breaker can also be used on its own with `breaker.call(operation)`. Share one
-`CircuitBreaker` instance per protected dependency across threads.
+The budget includes operation execution, circuit-breaker admission, and retry sleeps. The first attempt always runs, even when `timeout=0`; after a retryable failure, the next attempt is scheduled only if the full backoff delay would end strictly before the deadline. If the deadline prevents another retry, the last retryable exception is re-raised unchanged, just as it is when attempts are exhausted.
+
+The default clock is `time.monotonic`. Tests can inject a clock and a matching sleep function. Both should use the same time source:
+
+```python
+class FakeClock:
+    def __init__(self):
+        self.now = 0.0
+
+    def __call__(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.now += seconds
+
+clock = FakeClock()
+retry_call(operation, timeout=3, clock=clock, sleep=clock.sleep)
+```
+
+`timeout=None` preserves the prior retry behavior and does not call the clock. Timeout values must be finite, non-negative numbers; booleans are not accepted.
+
+**Limitation:** This is a retry deadline, not hard cancellation. A synchronous operation that is already running can continue past the deadline. The timeout controls whether another retry is started; it does not forcibly interrupt arbitrary Python code or bound an individual network call. Use the relevant client's own timeout settings when a blocking operation must be bounded.
 
 ## API
 
-### `retry_call`
-
-`retry_call(operation, *, max_attempts=3, retry_on=(Exception,), base_delay=0.1, max_delay=10.0, jitter=False, sleep=time.sleep, random_fn=random.random, circuit_breaker=None)`
-
-Calls `operation` until it succeeds or a non-retryable exception occurs.
+`retry_call(operation, *, max_attempts=3, retry_on=(Exception,), base_delay=0.1, max_delay=10.0, jitter=False, sleep=time.sleep, random_fn=random.random, circuit_breaker=None, timeout=None, clock=time.monotonic)`
 
 - `operation`: zero-argument callable.
 - `max_attempts`: total number of calls; must be at least 1.
@@ -96,67 +102,22 @@ Calls `operation` until it succeeds or a non-retryable exception occurs.
 - `jitter`: if enabled, multiplies delay by a random factor in `[0, 1)`.
 - `sleep`: injectable waiting function, useful for tests.
 - `random_fn`: injectable random source returning a number in `[0, 1)`.
-- `circuit_breaker`: optional `CircuitBreaker`. When supplied, every attempt is routed through `circuit_breaker.call(operation)`.
+- `circuit_breaker`: optional `CircuitBreaker`; each admitted failed attempt is counted by the breaker.
+- `timeout`: optional total retry budget in seconds, or `None` for no deadline.
+- `clock`: callable returning monotonic seconds. It is validated on every call but only invoked when `timeout` is configured.
 
 The delay before retry number `n` (starting at 1) is `min(base_delay * 2 ** (n - 1), max_delay)`. With jitter enabled, that delay is multiplied by `random_fn()`.
 
-Non-retryable exceptions propagate immediately. The final retryable exception is re-raised when attempts are exhausted.
-
-### `CircuitBreaker`
-
-`CircuitBreaker(*, failure_threshold=5, recovery_timeout=30.0, half_open_max_calls=1, success_threshold=1, failure_on=(Exception,), clock=time.monotonic)`
-
-- `failure_threshold`: consecutive failures while `CLOSED` that open the circuit; must be at least 1.
-- `recovery_timeout`: seconds the circuit stays `OPEN` before trial calls are admitted; must be non-negative.
-- `half_open_max_calls`: maximum number of *concurrent* trial calls admitted while `HALF_OPEN`; must be at least 1.
-- `success_threshold`: consecutive successful trial calls required to close the circuit; must be at least 1.
-- `failure_on`: tuple of exception classes that count as failures. Any other exception is re-raised but does not affect the breaker.
-- `clock`: injectable monotonic time source, useful for tests.
-
-Members:
-
-- `breaker.call(operation)`: runs the zero-argument `operation` if the breaker admits the call, otherwise raises `CircuitOpenError` without calling it. Exceptions from `operation` propagate unchanged.
-- `breaker.state`: the current `CircuitState` (`CLOSED`, `OPEN`, or `HALF_OPEN`).
-- `breaker.failure_count`: consecutive failures recorded while `CLOSED`; retained while `OPEN`.
-- `breaker.reset()`: forces the breaker back to `CLOSED` and clears its counters.
-
-Invalid configuration raises `CircuitBreakerConfigurationError` (a `ValueError`). `CircuitOpenError` exposes the rejecting breaker as `error.breaker`.
-
-#### State transitions
-
-| From        | To          | When                                                                 |
-|-------------|-------------|----------------------------------------------------------------------|
-| `CLOSED`    | `OPEN`      | `failure_threshold` consecutive failures (a success resets the count) |
-| `OPEN`      | `HALF_OPEN` | `recovery_timeout` seconds have elapsed since opening                  |
-| `HALF_OPEN` | `OPEN`      | any trial call fails (the timeout restarts)                            |
-| `HALF_OPEN` | `CLOSED`    | `success_threshold` consecutive trial calls succeed                    |
-| any         | `CLOSED`    | `breaker.reset()`                                                      |
-
-While `OPEN`, calls are rejected immediately. While `HALF_OPEN`, at most `half_open_max_calls` calls may be in flight at once; additional calls are rejected until a permit is released. The `OPEN` to `HALF_OPEN` transition is evaluated lazily whenever a call is admitted or `state` / `failure_count` is read; no background thread is used.
-
-#### Thread safety
-
-All state transitions and `HALF_OPEN` admission decisions happen under a single lock; the protected operation itself runs outside the lock. Results of calls that were admitted before a state change are discarded, so a slow call cannot corrupt a newer state (for example, a stale success cannot close a circuit that re-opened in the meantime).
-
-#### Interaction with retries
-
-When `retry_call` is given a `circuit_breaker`:
-
-- Each attempt is a separate `breaker.call`, so **every failed attempt counts as one breaker failure**. With `max_attempts=3` and `failure_threshold=5`, two exhausted retry calls are enough to open the circuit.
-- `retry_on` decides what `retry_call` retries; `failure_on` decides what the breaker counts. They are independent: an exception can be retried without counting as a breaker failure, and vice versa.
-- A `CircuitOpenError` raised by the supplied breaker propagates immediately. It does not consume further attempts and no delay is slept, even if `retry_on` would match it (for example with the default `retry_on=(Exception,)`).
-- A `CircuitOpenError` raised from inside the operation by a *different* breaker is treated like any other exception: `retry_on` decides whether it is retried and `failure_on` decides whether it counts.
-
-Without a `circuit_breaker`, `retry_call` behaves exactly as in the previous release.
+Non-retryable exceptions propagate immediately. A rejection from the supplied circuit breaker also propagates immediately without another retry or sleep. The final retryable exception is re-raised unchanged when attempts are exhausted or the deadline prevents another retry.
 
 ## Development
 
 ```bash
 python -m pip install -e ".[dev]"
-pytest -v
+python -m pytest -v
 ruff check .
 ```
 
 ## Scope and limitations
 
-This milestone provides synchronous retry and circuit breaker behavior only. It does not implement HTTP clients, timeout enforcement, asynchronous operation, metrics, or distributed coordination. The circuit breaker's state is local to the process and to each `CircuitBreaker` instance; it counts consecutive failures rather than a failure rate over a sliding window, and it does not enforce timeouts on the protected operation. Retrying is safe only when the operation's semantics allow it; retrying a non-idempotent payment request can cause duplicate effects unless the remote API supports idempotency keys.
+The toolkit currently provides synchronous retries, deadline-aware retry scheduling, exponential backoff, and a thread-safe circuit breaker. It does not forcibly interrupt synchronous operations, provide HTTP-client wrappers, or implement asynchronous retries, metrics, or distributed coordination. Retrying is safe only when the operation's semantics allow it; retrying a non-idempotent payment request can cause duplicate effects unless the remote API supports idempotency keys.
